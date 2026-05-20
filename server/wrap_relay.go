@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const wrapPacketBufferSize = 4096
+const wrapPacketBufferSize = 8192
 
 type wrappedUDPRelay struct {
 	public      net.PacketConn
