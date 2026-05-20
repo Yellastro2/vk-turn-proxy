@@ -103,7 +103,7 @@ func (s *UserSession) backendReaderLoop() {
 			log.Printf("Session %s DTLS write error: %v", s.ID, err)
 			conn.Close()
 		}
-    }
+	}
 }
 
 func (s *UserSession) AddConn(id byte, conn net.Conn) {
@@ -151,6 +151,8 @@ func (s *UserSession) Cleanup() {
 func main() {
 	listen := flag.String("listen", "0.0.0.0:56000", "listen on ip:port")
 	connect := flag.String("connect", "", "connect to ip:port")
+	wrapKeyHex := flag.String("wrap-key", "", "WRAP key as 64 hex characters; empty disables WRAP")
+	noDTLS := flag.Bool("no-dtls", false, "accept WRAP datagrams without DTLS")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -185,6 +187,49 @@ func main() {
 		ConnectionIDGenerator: dtls.RandomCIDGenerator(8),
 	}
 
+	manager := &SessionManager{
+		Sessions: make(map[string]*UserSession),
+	}
+
+	if *wrapKeyHex != "" {
+		wrapKey, err := decodeWrapKey(*wrapKeyHex)
+		if err != nil {
+			log.Fatalf("Invalid WRAP key: %v", err)
+		}
+
+		publicConn, err := net.ListenPacket("udp", *listen)
+		if err != nil {
+			panic(err)
+		}
+		context.AfterFunc(ctx, func() {
+			publicConn.Close()
+		})
+
+		if *noDTLS {
+			log.Printf("Listening on %s with WRAP/no-DTLS, forwarding to %s", *listen, *connect)
+			serveWrappedNoDTLS(ctx, publicConn, manager, *connect, wrapKey)
+			return
+		}
+
+		internalAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+		if err != nil {
+			panic(err)
+		}
+		listener, err := dtls.Listen("udp", internalAddr, config)
+		if err != nil {
+			panic(err)
+		}
+		context.AfterFunc(ctx, func() {
+			listener.Close()
+		})
+
+		relay := newWrappedUDPRelay(publicConn, listener.Addr(), wrapKey)
+		go relay.Run(ctx)
+		log.Printf("Listening on %s with WRAP/DTLS, forwarding to %s", *listen, *connect)
+		serveDTLS(ctx, listener, manager, *connect)
+		return
+	}
+
 	listener, err := dtls.Listen("udp", addr, config)
 	if err != nil {
 		panic(err)
@@ -192,13 +237,11 @@ func main() {
 	context.AfterFunc(ctx, func() {
 		listener.Close()
 	})
+	log.Printf("Listening on %s with DTLS, forwarding to %s", *listen, *connect)
+	serveDTLS(ctx, listener, manager, *connect)
+}
 
-	manager := &SessionManager{
-		Sessions: make(map[string]*UserSession),
-	}
-
-	log.Printf("Listening on %s, forwarding to %s", *listen, *connect)
-
+func serveDTLS(ctx context.Context, listener net.Listener, manager *SessionManager, connectAddr string) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -238,7 +281,7 @@ func main() {
 			sessionID := fmt.Sprintf("%x", idBuf[:16])
 			streamID := idBuf[16]
 
-			session, err := manager.GetOrCreate(ctx, sessionID, *connect)
+			session, err := manager.GetOrCreate(ctx, sessionID, connectAddr)
 			if err != nil {
 				log.Println("Failed to get/create session:", err)
 				return

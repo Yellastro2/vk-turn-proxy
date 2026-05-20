@@ -45,6 +45,20 @@ client/
 ./server -listen 0.0.0.0:56000 -connect 127.0.0.1:<порт wg>
 ```
 
+WRAP-маскировка внешнего трафика:
+
+```
+./server -listen 0.0.0.0:56000 -connect 127.0.0.1:<порт wg> -wrap-key <64 hex>
+```
+
+Если Android-клиент запущен с `NoDTLS`, сервер тоже надо запускать в plain WRAP-режиме:
+
+```
+./server -listen 0.0.0.0:56000 -connect 127.0.0.1:<порт wg> -wrap-key <64 hex> -no-dtls
+```
+
+`-wrap-key` должен совпадать с `#@wgt:WrapKey` на Android-клиенте.
+
 ### Клиент
 
 #### Android
