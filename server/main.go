@@ -10,7 +10,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,14 +25,25 @@ type streamEntry struct {
 	conn net.Conn
 }
 
+const (
+	handshakeTimeout   = 30 * time.Second
+	streamIdleTimeout  = 5 * time.Minute
+	sessionIdleTimeout = 5 * time.Minute
+)
+
+var pendingHandshakes atomic.Int64
+
 type UserSession struct {
-	ID          string
-	Conns       []streamEntry
-	BackendConn net.Conn
-	Lock        sync.RWMutex
-	Ctx         context.Context
-	Cancel      context.CancelFunc
-	Manager     *SessionManager
+	ID               string
+	Conns            []streamEntry
+	BackendConn      net.Conn
+	Lock             sync.RWMutex
+	Ctx              context.Context
+	Cancel           context.CancelFunc
+	Manager          *SessionManager
+	Closing          bool
+	CleanupOnce      sync.Once
+	idleCleanupTimer *time.Timer
 }
 
 type SessionManager struct {
@@ -38,12 +51,38 @@ type SessionManager struct {
 	Lock     sync.RWMutex
 }
 
+type sessionStats struct {
+	sessions int
+	streams  int
+}
+
+func (s *SessionManager) Stats() sessionStats {
+	s.Lock.RLock()
+	defer s.Lock.RUnlock()
+
+	stats := sessionStats{
+		sessions: len(s.Sessions),
+	}
+	for _, session := range s.Sessions {
+		session.Lock.RLock()
+		stats.streams += len(session.Conns)
+		session.Lock.RUnlock()
+	}
+	return stats
+}
+
 func (s *SessionManager) GetOrCreate(ctx context.Context, id string, connectAddr string) (*UserSession, error) {
 	s.Lock.Lock()
 	defer s.Lock.Unlock()
 
 	if session, ok := s.Sessions[id]; ok {
-		return session, nil
+		session.Lock.RLock()
+		closing := session.Closing
+		session.Lock.RUnlock()
+		if !closing {
+			return session, nil
+		}
+		delete(s.Sessions, id)
 	}
 
 	backendConn, err := net.Dial("udp", connectAddr)
@@ -77,7 +116,7 @@ func (s *UserSession) backendReaderLoop() {
 		default:
 		}
 
-		s.BackendConn.SetReadDeadline(time.Now().Add(time.Minute * 5))
+		s.BackendConn.SetReadDeadline(time.Now().Add(streamIdleTimeout))
 		n, err := s.BackendConn.Read(buf)
 		if err != nil {
 			log.Printf("Session %s backend read error: %v", s.ID, err)
@@ -96,7 +135,7 @@ func (s *UserSession) backendReaderLoop() {
 		conn := s.Conns[lastUsed].conn
 		s.Lock.RUnlock()
 
-		conn.SetWriteDeadline(time.Now().Add(time.Second * 10))
+		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 
 		_, err = conn.Write(buf[:n])
 		if err != nil {
@@ -106,9 +145,17 @@ func (s *UserSession) backendReaderLoop() {
 	}
 }
 
-func (s *UserSession) AddConn(id byte, conn net.Conn) {
+func (s *UserSession) AddConn(id byte, conn net.Conn) error {
 	s.Lock.Lock()
 	defer s.Lock.Unlock()
+
+	if s.Closing {
+		return net.ErrClosed
+	}
+	if s.idleCleanupTimer != nil {
+		s.idleCleanupTimer.Stop()
+		s.idleCleanupTimer = nil
+	}
 
 	// Evict existing connection with same ID
 	for i, entry := range s.Conns {
@@ -116,38 +163,131 @@ func (s *UserSession) AddConn(id byte, conn net.Conn) {
 			//log.Printf("Session %s: Evicting old stream %d", s.ID, id)
 			entry.conn.Close()
 			s.Conns[i].conn = conn
-			return
+			return nil
 		}
 	}
 
 	s.Conns = append(s.Conns, streamEntry{id: id, conn: conn})
+	return nil
 }
 
 func (s *UserSession) RemoveConn(id byte, conn net.Conn) {
 	s.Lock.Lock()
 	defer s.Lock.Unlock()
+	if s.Closing {
+		return
+	}
 	for i, entry := range s.Conns {
 		if entry.id == id && entry.conn == conn {
 			s.Conns = append(s.Conns[:i], s.Conns[i+1:]...)
 			break
 		}
 	}
-}
-func (s *UserSession) Cleanup() {
-	s.Cancel()
-	s.BackendConn.Close()
-
-	s.Manager.Lock.Lock()
-	delete(s.Manager.Sessions, s.ID)
-	s.Manager.Lock.Unlock()
-
-	s.Lock.Lock()
-	for _, entry := range s.Conns {
-		entry.conn.Close()
+	if len(s.Conns) == 0 {
+		s.scheduleIdleCleanupLocked()
 	}
-	s.Conns = nil
-	s.Lock.Unlock()
 }
+
+func (s *UserSession) scheduleIdleCleanupLocked() {
+	if s.idleCleanupTimer != nil {
+		s.idleCleanupTimer.Stop()
+	}
+	s.idleCleanupTimer = time.AfterFunc(sessionIdleTimeout, func() {
+		s.Lock.Lock()
+		shouldCleanup := !s.Closing && len(s.Conns) == 0
+		if shouldCleanup {
+			s.Closing = true
+		}
+		s.Lock.Unlock()
+
+		if shouldCleanup {
+			log.Printf("Session %s idle without streams for %v, cleaning up", s.ID, sessionIdleTimeout)
+			s.Cleanup()
+		}
+	})
+}
+
+func (s *UserSession) Cleanup() {
+	s.CleanupOnce.Do(func() {
+		s.Lock.Lock()
+		s.Closing = true
+		if s.idleCleanupTimer != nil {
+			s.idleCleanupTimer.Stop()
+			s.idleCleanupTimer = nil
+		}
+		conns := s.Conns
+		s.Conns = nil
+		s.Lock.Unlock()
+
+		s.Cancel()
+		_ = s.BackendConn.Close()
+
+		s.Manager.Lock.Lock()
+		if current, ok := s.Manager.Sessions[s.ID]; ok && current == s {
+			delete(s.Manager.Sessions, s.ID)
+		}
+		s.Manager.Lock.Unlock()
+
+		for _, entry := range conns {
+			entry.conn.Close()
+		}
+	})
+}
+
+func processFDStats() (int, int) {
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return -1, -1
+	}
+
+	socketFDs := 0
+	for _, entry := range entries {
+		target, err := os.Readlink("/proc/self/fd/" + entry.Name())
+		if err != nil {
+			continue
+		}
+		if len(target) >= len("socket:[") && target[:len("socket:[")] == "socket:[" {
+			socketFDs++
+		}
+	}
+	return len(entries), socketFDs
+}
+
+func diagnosticsLoop(ctx context.Context, manager *SessionManager, relay *wrappedUDPRelay) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			stats := manager.Stats()
+			fdCount, socketFDs := processFDStats()
+			relayClients := 0
+			relayUniqueIPs := 0
+			if relay != nil {
+				relayStats := relay.Stats()
+				relayClients = relayStats.clients
+				relayUniqueIPs = relayStats.uniqueIPs
+			}
+
+			log.Printf(
+				"[diagnostics] active_clients~=%d sessions=%d streams=%d pending_handshakes=%d wrap_relay_clients=%d wrap_relay_unique_ips=%d fd=%d socket_fd=%d goroutines=%d",
+				stats.sessions,
+				stats.sessions,
+				stats.streams,
+				pendingHandshakes.Load(),
+				relayClients,
+				relayUniqueIPs,
+				fdCount,
+				socketFDs,
+				runtime.NumGoroutine(),
+			)
+		}
+	}
+}
+
 func main() {
 	listen := flag.String("listen", "0.0.0.0:56000", "listen on ip:port")
 	connect := flag.String("connect", "", "connect to ip:port")
@@ -207,6 +347,7 @@ func main() {
 
 		if *noDTLS {
 			log.Printf("Listening on %s with WRAP/no-DTLS, forwarding to %s", *listen, *connect)
+			go diagnosticsLoop(ctx, manager, nil)
 			serveWrappedNoDTLS(ctx, publicConn, manager, *connect, wrapKey)
 			return
 		}
@@ -226,6 +367,7 @@ func main() {
 		relay := newWrappedUDPRelay(publicConn, listener.Addr(), wrapKey)
 		go relay.Run(ctx)
 		log.Printf("Listening on %s with WRAP/DTLS, forwarding to %s", *listen, *connect)
+		go diagnosticsLoop(ctx, manager, relay)
 		serveDTLS(ctx, listener, manager, *connect)
 		return
 	}
@@ -238,6 +380,7 @@ func main() {
 		listener.Close()
 	})
 	log.Printf("Listening on %s with DTLS, forwarding to %s", *listen, *connect)
+	go diagnosticsLoop(ctx, manager, nil)
 	serveDTLS(ctx, listener, manager, *connect)
 }
 
@@ -262,20 +405,35 @@ func serveDTLS(ctx context.Context, listener net.Listener, manager *SessionManag
 				return
 			}
 
-			handshakeCtx, hCancel := context.WithTimeout(ctx, 30*time.Second)
+			handshakeCtx, hCancel := context.WithTimeout(ctx, handshakeTimeout)
 			defer hCancel()
 
+			pendingHandshakes.Add(1)
 			if err := dtlsConn.HandshakeContext(handshakeCtx); err != nil {
-				log.Println("Handshake failed:", err)
+				pendingHandshakes.Add(-1)
+				stats := manager.Stats()
+				fdCount, socketFDs := processFDStats()
+				log.Printf(
+					"Handshake failed from %s: %v (sessions=%d streams=%d pending_handshakes=%d fd=%d socket_fd=%d goroutines=%d)",
+					conn.RemoteAddr(),
+					err,
+					stats.sessions,
+					stats.streams,
+					pendingHandshakes.Load(),
+					fdCount,
+					socketFDs,
+					runtime.NumGoroutine(),
+				)
 				return
 			}
+			pendingHandshakes.Add(-1)
 
 			// Phase 1: Read Session ID + Stream ID (17 bytes)
 			idBuf := make([]byte, 17)
 			conn.SetReadDeadline(time.Now().Add(time.Second * 5))
 			_, err := io.ReadFull(conn, idBuf)
 			if err != nil {
-				log.Println("Failed to read session ID:", err)
+				log.Printf("Failed to read session ID from %s: %v", conn.RemoteAddr(), err)
 				return
 			}
 			sessionID := fmt.Sprintf("%x", idBuf[:16])
@@ -287,7 +445,10 @@ func serveDTLS(ctx context.Context, listener net.Listener, manager *SessionManag
 				return
 			}
 
-			session.AddConn(streamID, conn)
+			if err := session.AddConn(streamID, conn); err != nil {
+				log.Printf("Failed to add stream %d for session %s from %s: %v", streamID, sessionID, conn.RemoteAddr(), err)
+				return
+			}
 			defer session.RemoveConn(streamID, conn)
 
 			log.Printf("New stream %d for session %s from %s", streamID, sessionID, conn.RemoteAddr())
@@ -295,7 +456,7 @@ func serveDTLS(ctx context.Context, listener net.Listener, manager *SessionManag
 			// Upstream Loop: DTLS -> Backend
 			buf := make([]byte, 1600)
 			for {
-				conn.SetReadDeadline(time.Now().Add(time.Minute * 5))
+				conn.SetReadDeadline(time.Now().Add(streamIdleTimeout))
 				n, err := conn.Read(buf)
 				if err != nil {
 					log.Printf("Stream %s closed: %v", sessionID, err)

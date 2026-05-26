@@ -9,7 +9,11 @@ import (
 	"time"
 )
 
-const wrapPacketBufferSize = 8192
+const (
+	wrapPacketBufferSize = 8192
+	wrapRelayIdleTimeout = 10 * time.Minute
+	wrapRelaySweepPeriod = time.Minute
+)
 
 type wrappedUDPRelay struct {
 	public      net.PacketConn
@@ -26,7 +30,13 @@ type wrappedUDPClient struct {
 	internal   *net.UDPConn
 	key        []byte
 	relay      *wrappedUDPRelay
+	lastSeen   time.Time
 	closeOnce  sync.Once
+}
+
+type wrappedUDPRelayStats struct {
+	clients   int
+	uniqueIPs int
 }
 
 // newWrappedUDPRelay bridges public WRAP datagrams to an internal DTLS UDP listener.
@@ -43,8 +53,29 @@ func newWrappedUDPRelay(public net.PacketConn, internal net.Addr, key []byte) *w
 	}
 }
 
+func (r *wrappedUDPRelay) Stats() wrappedUDPRelayStats {
+	r.clientsLock.Lock()
+	defer r.clientsLock.Unlock()
+
+	uniqueIPs := make(map[string]struct{}, len(r.clients))
+	for id := range r.clients {
+		host, _, err := net.SplitHostPort(id)
+		if err != nil {
+			host = id
+		}
+		uniqueIPs[host] = struct{}{}
+	}
+
+	return wrappedUDPRelayStats{
+		clients:   len(r.clients),
+		uniqueIPs: len(uniqueIPs),
+	}
+}
+
 // Run unwraps public packets and forwards them to the internal DTLS listener.
 func (r *wrappedUDPRelay) Run(ctx context.Context) {
+	go r.cleanupIdleClients(ctx)
+
 	buf := make([]byte, wrapPacketBufferSize)
 	plain := make([]byte, wrapPacketBufferSize)
 	for {
@@ -82,10 +113,12 @@ func (r *wrappedUDPRelay) Run(ctx context.Context) {
 
 func (r *wrappedUDPRelay) getClient(ctx context.Context, addr net.Addr) (*wrappedUDPClient, error) {
 	id := addr.String()
+	now := time.Now()
 	r.clientsLock.Lock()
 	defer r.clientsLock.Unlock()
 
 	if client, ok := r.clients[id]; ok {
+		client.lastSeen = now
 		return client, nil
 	}
 
@@ -101,10 +134,40 @@ func (r *wrappedUDPRelay) getClient(ctx context.Context, addr net.Addr) (*wrappe
 		internal:   internalConn,
 		key:        r.key,
 		relay:      r,
+		lastSeen:   now,
 	}
 	r.clients[id] = client
 	go client.readInternal(ctx)
 	return client, nil
+}
+
+func (r *wrappedUDPRelay) cleanupIdleClients(ctx context.Context) {
+	ticker := time.NewTicker(wrapRelaySweepPeriod)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-wrapRelayIdleTimeout)
+			var stale []*wrappedUDPClient
+
+			r.clientsLock.Lock()
+			for id, client := range r.clients {
+				if client.lastSeen.Before(cutoff) {
+					delete(r.clients, id)
+					stale = append(stale, client)
+				}
+			}
+			r.clientsLock.Unlock()
+
+			for _, client := range stale {
+				log.Printf("WRAP relay: client %s idle for %v, closing", client.id, wrapRelayIdleTimeout)
+				client.Close()
+			}
+		}
+	}
 }
 
 func (r *wrappedUDPRelay) removeClient(id string, client *wrappedUDPClient) {
@@ -253,7 +316,10 @@ func serveWrappedNoDTLS(ctx context.Context, public net.PacketConn, manager *Ses
 				continue
 			}
 			conn := &plainWrappedConn{public: public, addr: addr, key: key}
-			session.AddConn(streamID, conn)
+			if err := session.AddConn(streamID, conn); err != nil {
+				log.Printf("WRAP/no-DTLS: failed to add stream %d for session %s from %s: %v", streamID, sessionID, addr, err)
+				continue
+			}
 
 			stream = &plainWrappedStream{
 				session:  session,
