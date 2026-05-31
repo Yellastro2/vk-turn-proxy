@@ -12,11 +12,13 @@ import (
 )
 
 const (
-	wrapKeyLen    = 32
-	wrapHdrLen    = 12
-	wrapMaxPad    = 32
-	wrapPadLen    = 2
-	wrapCoverMark = 0xFFFF
+	wrapKeyLen      = 32
+	wrapHdrLen      = 12
+	wrapV2PrefixLen = 12
+	wrapV2Magic     = 0x9d7c2b41
+	wrapMaxPad      = 32
+	wrapPadLen      = 2
+	wrapCoverMark   = 0xFFFF
 )
 
 var wrapCounter atomic.Uint64
@@ -46,12 +48,26 @@ func putHeader(buf []byte, counter uint64, payloadLen int) {
 	_ = payloadLen
 }
 
-// readHeader recovers the packet counter encoded in a WRAP RTP-like header.
+// readHeader recovers the legacy packet counter encoded in a WRAP RTP-like header.
 func readHeader(buf []byte) (counter uint64, payloadLen int) {
 	ts := uint64(binary.BigEndian.Uint32(buf[4:8]))
 	counter = ts / 960
 	payloadLen = 0
 	return
+}
+
+// putV2Prefix stores the WRAP v2 counter outside the RTP-like header.
+func putV2Prefix(buf []byte, counter uint64) {
+	binary.BigEndian.PutUint32(buf[:4], wrapV2Magic)
+	binary.BigEndian.PutUint64(buf[4:12], counter)
+}
+
+// readV2Prefix recovers the WRAP v2 counter from packet payload bytes that TURN relays should not rewrite.
+func readV2Prefix(buf []byte) (uint64, bool) {
+	if len(buf) < wrapV2PrefixLen || binary.BigEndian.Uint32(buf[:4]) != wrapV2Magic {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(buf[4:12]), true
 }
 
 // xorKeystream expands the WRAP key and packet counter into a per-packet byte stream.
@@ -114,7 +130,7 @@ func randPadLen() int {
 	return int(b[0]) % (wrapMaxPad + 1)
 }
 
-// wrapPacket masks one relay datagram with an RTP-like header, padding and a keyed XOR body.
+// wrapPacket masks one relay datagram with an RTP-like header, a stable v2 counter prefix, padding and a keyed XOR body.
 func wrapPacket(key, payload []byte) ([]byte, error) {
 	if len(key) != wrapKeyLen {
 		return nil, fmt.Errorf("wrap: key must be %d bytes", wrapKeyLen)
@@ -131,22 +147,15 @@ func wrapPacket(key, payload []byte) ([]byte, error) {
 
 	xorInPlace(key, counter, plaintext)
 
-	out := make([]byte, wrapHdrLen+len(plaintext))
+	out := make([]byte, wrapHdrLen+wrapV2PrefixLen+len(plaintext))
 	putHeader(out[:wrapHdrLen], counter, len(plaintext))
-	copy(out[wrapHdrLen:], plaintext)
+	putV2Prefix(out[wrapHdrLen:wrapHdrLen+wrapV2PrefixLen], counter)
+	copy(out[wrapHdrLen+wrapV2PrefixLen:], plaintext)
 	return out, nil
 }
 
-// unwrapPacket restores one WRAP datagram and skips cover packets by returning zero bytes.
-func unwrapPacket(key, wire, dst []byte) (int, error) {
-	if len(key) != wrapKeyLen {
-		return 0, fmt.Errorf("wrap: key must be %d bytes", wrapKeyLen)
-	}
-	if len(wire) < wrapHdrLen+wrapPadLen {
-		return 0, errors.New("wrap: short packet")
-	}
-	counter, _ := readHeader(wire[:wrapHdrLen])
-	ciphertext := wire[wrapHdrLen:]
+// unwrapCiphertext restores one encrypted WRAP body and skips cover packets by returning zero bytes.
+func unwrapCiphertext(key []byte, counter uint64, ciphertext, dst []byte) (int, error) {
 	if len(ciphertext) < wrapPadLen {
 		return 0, errors.New("wrap: encrypted payload too short")
 	}
@@ -167,4 +176,21 @@ func unwrapPacket(key, wire, dst []byte) (int, error) {
 	}
 	copy(dst, plaintext[:n])
 	return n, nil
+}
+
+// unwrapPacket restores one WRAP datagram and skips cover packets by returning zero bytes.
+func unwrapPacket(key, wire, dst []byte) (int, error) {
+	if len(key) != wrapKeyLen {
+		return 0, fmt.Errorf("wrap: key must be %d bytes", wrapKeyLen)
+	}
+	if len(wire) < wrapHdrLen+wrapPadLen {
+		return 0, errors.New("wrap: short packet")
+	}
+	body := wire[wrapHdrLen:]
+	if counter, ok := readV2Prefix(body); ok {
+		return unwrapCiphertext(key, counter, body[wrapV2PrefixLen:], dst)
+	}
+
+	counter, _ := readHeader(wire[:wrapHdrLen])
+	return unwrapCiphertext(key, counter, body, dst)
 }
