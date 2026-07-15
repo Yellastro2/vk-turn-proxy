@@ -1,0 +1,6 @@
+chmod +x run-vk-turn-proxy-service.sh
+
+export GH_TOKEN='НОВЫЙ_GITHUB_TOKEN'
+export WRAP_KEY='ТВОЙ_64_HEX_WRAP_KEY'
+
+./run-vk-turn-proxy-service.sh
