@@ -384,7 +384,7 @@ func main() {
 	serveDTLS(ctx, listener, manager, *connect)
 }
 
-// serveDTLS обслуживает потоки и отвечает на пробы клиента внутри того же DTLS-соединения.
+// serveDTLS обслуживает потоки и обновляет write-deadline перед служебными ответами после простоя.
 func serveDTLS(ctx context.Context, listener net.Listener, manager *SessionManager, connectAddr string) {
 	for {
 		conn, err := listener.Accept()
@@ -456,6 +456,7 @@ func serveDTLS(ctx context.Context, listener net.Listener, manager *SessionManag
 
 			probeEnabled := string(idBuf[:4]) == "RNKP" && idBuf[6]>>4 == 8
 			if probeEnabled {
+				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 				if _, err := conn.Write([]byte("RNK-PROBE/1 READY")); err != nil {
 					return
 				}
@@ -473,7 +474,9 @@ func serveDTLS(ctx context.Context, listener net.Listener, manager *SessionManag
 
 				if probeEnabled && n == 24 && string(buf[:16]) == "RNK-PROBE/1 PING" {
 					copy(buf[:16], "RNK-PROBE/1 PONG")
+					conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 					if _, err := conn.Write(buf[:n]); err != nil {
+						log.Printf("[serveDTLS] Не удалось отправить ответ на пробу: поток=%d, ошибка=%v", streamID, err)
 						return
 					}
 					continue
