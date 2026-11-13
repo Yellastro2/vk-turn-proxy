@@ -384,6 +384,7 @@ func main() {
 	serveDTLS(ctx, listener, manager, *connect)
 }
 
+// serveDTLS обслуживает потоки и отвечает на пробы клиента внутри того же DTLS-соединения.
 func serveDTLS(ctx context.Context, listener net.Listener, manager *SessionManager, connectAddr string) {
 	for {
 		conn, err := listener.Accept()
@@ -453,6 +454,13 @@ func serveDTLS(ctx context.Context, listener net.Listener, manager *SessionManag
 
 			log.Printf("New stream %d for session %s from %s", streamID, sessionID, conn.RemoteAddr())
 
+			probeEnabled := string(idBuf[:4]) == "RNKP" && idBuf[6]>>4 == 8
+			if probeEnabled {
+				if _, err := conn.Write([]byte("RNK-PROBE/1 READY")); err != nil {
+					return
+				}
+			}
+
 			// Upstream Loop: DTLS -> Backend
 			buf := make([]byte, 1600)
 			for {
@@ -463,6 +471,13 @@ func serveDTLS(ctx context.Context, listener net.Listener, manager *SessionManag
 					return
 				}
 
+				if probeEnabled && n == 24 && string(buf[:16]) == "RNK-PROBE/1 PING" {
+					copy(buf[:16], "RNK-PROBE/1 PONG")
+					if _, err := conn.Write(buf[:n]); err != nil {
+						return
+					}
+					continue
+				}
 				session.BackendConn.SetWriteDeadline(time.Now().Add(time.Second * 5))
 				_, err = session.BackendConn.Write(buf[:n])
 				if err != nil {
