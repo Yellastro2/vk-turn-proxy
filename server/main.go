@@ -105,6 +105,8 @@ func (s *SessionManager) GetOrCreate(ctx context.Context, id string, connectAddr
 	return session, nil
 }
 
+// backendReaderLoop передаёт ответы VPN клиенту и ждёт их до закрытия сессии.
+// Cleanup закрывает UDP-сокет и разблокирует Read, в том числе после ухода всех потоков.
 func (s *UserSession) backendReaderLoop() {
 	defer s.Cleanup()
 	buf := make([]byte, 1600)
@@ -116,10 +118,11 @@ func (s *UserSession) backendReaderLoop() {
 		default:
 		}
 
-		s.BackendConn.SetReadDeadline(time.Now().Add(streamIdleTimeout))
 		n, err := s.BackendConn.Read(buf)
 		if err != nil {
-			log.Printf("Session %s backend read error: %v", s.ID, err)
+			if s.Ctx.Err() == nil {
+				log.Printf("[backendReaderLoop] Ошибка чтения VPN-сокета сессии %s: %v", s.ID, err)
+			}
 			return
 		}
 
